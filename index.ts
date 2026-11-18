@@ -18,7 +18,9 @@ const UA = 'GarantKZ/1.0 (land plot risk check, student project)';
 const KZ = { latMin: 40.4, latMax: 55.6, lonMin: 46.3, lonMax: 87.5 };
 const RADIUS = 500;          // metres searched around the plot
 const AI_DAILY_LIMIT = 20;   // questions per user per day
-const OVERPASS = ['https://overpass-api.de/api/interpreter', 'https://overpass.private.coffee/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
+// The browser normally sends the map data itself (see actionCheck): OpenStreetMap servers block
+// requests from cloud data centres (overpass-api.de answers 406, Nominatim 403). These mirrors are a fallback.
+const OVERPASS = ['https://overpass.private.coffee/api/interpreter', 'https://overpass.kumi.systems/api/interpreter', 'https://overpass-api.de/api/interpreter'];
 
 const json = (body) => new Response(JSON.stringify(body), { status: 200, headers: { ...CORS, 'Content-Type': 'application/json' } });
 const fail = (error, extra = {}) => json({ ok: false, error, ...extra });
@@ -133,7 +135,7 @@ async function overpass(lat, lon, r) {
   let lastErr = 'unavailable';
   for (const url of OVERPASS) {
     try {
-      const res = await fetchT(url, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': UA }, body }, 15000);
+      const res = await fetchT(url, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': UA, Accept: 'application/json' }, body }, 12000);
       if (!res.ok) { lastErr = 'http ' + res.status; continue; }
       const data = await res.json();
       if (data && Array.isArray(data.elements)) return { ok: true, elements: data.elements, stamp: (data.osm3s && data.osm3s.timestamp_osm_base) || null };
@@ -298,15 +300,62 @@ function nearestCity(cities, lat, lon) {
   }
   return best;
 }
+// Photon (komoot) answers requests from servers; its result is reshaped like a Nominatim answer
+async function photonReverse(lat, lon) {
+  try {
+    const r = await fetchT(`https://photon.komoot.io/reverse?lat=${lat}&lon=${lon}&limit=1&lang=default`, { headers: { 'User-Agent': UA } }, 7000);
+    if (!r.ok) return null;
+    const j = await r.json();
+    const p = j && j.features && j.features[0] && j.features[0].properties;
+    if (!p) return null;
+    const road = p.street || (p.osm_key === 'highway' ? p.name : '') || '';
+    const address = { road, house_number: p.housenumber || '', suburb: p.district || p.locality || '', city: p.city || p.county || '', state: p.state || '', country: p.country || '' };
+    const display_name = [p.housenumber, road, p.osm_key !== 'highway' && p.name !== road ? p.name : '', address.suburb, address.city, address.state, address.country].filter(Boolean).join(', ');
+    return display_name ? { display_name, address, source: 'photon' } : null;
+  } catch (_e) { return null; }
+}
 async function reverseGeocode(lat, lon) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const r = await fetchT(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=18&addressdetails=1&accept-language=ru`, { headers: { 'User-Agent': UA } }, 7000);
-      if (r.ok) { const j = await r.json(); if (j && j.address) return j; }
-    } catch (_e) { /* retried below */ }
-    if (attempt === 0) await new Promise((res) => setTimeout(res, 1100));
+  const ph = await photonReverse(lat, lon);
+  if (ph && ph.address.road) return ph;
+  try {
+    const r = await fetchT(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=18&addressdetails=1&accept-language=ru`, { headers: { 'User-Agent': UA } }, 7000);
+    if (r.ok) { const j = await r.json(); if (j && j.address) return j; }
+  } catch (_e) { /* fall through */ }
+  return ph;
+}
+// map data sent by the browser: checked for shape and size, never trusted beyond the user's own report
+const isNum = (v) => typeof v === 'number' && isFinite(v);
+function cleanGeom(g) {
+  if (!Array.isArray(g)) return null;
+  const out = [];
+  for (const c of g) if (c && isNum(c.lat) && isNum(c.lon)) out.push({ lat: c.lat, lon: c.lon });
+  return out.length ? out : null;
+}
+function cleanTags(t) {
+  if (!t || typeof t !== 'object') return {};
+  const out = {};
+  for (const [k, v] of Object.entries(t).slice(0, 60)) if (typeof v === 'string') out[String(k).slice(0, 40)] = v.slice(0, 200);
+  return out;
+}
+function cleanOsm(o) {
+  if (!o || typeof o !== 'object' || !Array.isArray(o.elements) || o.elements.length > 600) return null;
+  const elements = [];
+  for (const el of o.elements) {
+    if (!el || !['way', 'relation', 'node'].includes(el.type) || !isNum(el.id)) continue;
+    const e = { type: el.type, id: el.id, tags: cleanTags(el.tags) };
+    const g = cleanGeom(el.geometry);
+    if (g) e.geometry = g;
+    if (Array.isArray(el.members)) e.members = el.members.slice(0, 400).map((m) => ({ role: typeof (m && m.role) === 'string' ? m.role : '', geometry: cleanGeom(m && m.geometry) || [] }));
+    elements.push(e);
   }
-  return null;
+  const stamp = typeof o.stamp === 'string' && /^\d{4}-\d{2}-\d{2}/.test(o.stamp) ? o.stamp.slice(0, 25) : null;
+  return { ok: true, elements, stamp, via: 'browser' };
+}
+function cleanRev(r) {
+  if (!r || typeof r !== 'object' || !r.address || typeof r.address !== 'object') return null;
+  const address = {};
+  for (const k of ['road', 'pedestrian', 'residential', 'house_number', 'suburb', 'neighbourhood', 'quarter', 'city_district', 'city', 'town', 'village', 'state', 'country']) if (typeof r.address[k] === 'string') address[k] = r.address[k].slice(0, 200);
+  return { display_name: typeof r.display_name === 'string' ? r.display_name.slice(0, 500) : '', address };
 }
 
 /* ------------------------------------------------------------------ */
@@ -316,7 +365,7 @@ const LV = { high: 3, mid: 2, low: 1 };
 const projectBrief = (p) => ({ id: p.id, title_ru: p.title_ru, title_en: p.title_en, purpose_ru: p.purpose_ru, purpose_en: p.purpose_en, doc_ru: p.doc_ru, doc_en: p.doc_en,
   decree_date: p.decree_date, period_from: p.period_from, period_to: p.period_to, source_name: p.source_name, source_url: p.source_url, published_at: p.published_at });
 
-async function buildReport(req, plot) {
+async function buildReport(req, plot, pre = {}) {
   const toXY = projector(plot.lat, plot.lon);
   const ringLL = outerRing(plot.geom);
   const geo = { pts: [[0, 0]], ring: null, radius: 0 };
@@ -327,8 +376,8 @@ async function buildReport(req, plot) {
     geo.radius = Math.min(400, Math.max(...geo.ring.map((p) => Math.hypot(p[0], p[1]))));
   }
   const [osm, rev, cities] = await Promise.all([
-    overpass(plot.lat, plot.lon, Math.round(RADIUS + geo.radius)),
-    reverseGeocode(plot.lat, plot.lon),
+    pre.osm || overpass(plot.lat, plot.lon, Math.round(RADIUS + geo.radius)),
+    pre.rev || reverseGeocode(plot.lat, plot.lon),
     db(req, 'cities?select=*').catch(() => []),
   ]);
 
@@ -471,7 +520,7 @@ async function actionCheck(req, user, body) {
   if (prev && body.force !== true && Date.now() - Date.parse(prev.created_at) < 10 * 60 * 1000 && prev.data && prev.data.osm && prev.data.osm.ok) {
     return json({ ok: true, plot, report: prev, cached: true });
   }
-  const data = await buildReport(req, plot);
+  const data = await buildReport(req, plot, { osm: cleanOsm(body.osm), rev: cleanRev(body.rev) });
   const ins = await db(req, 'reports', { method: 'POST', body: { plot_id: plot.id, level: data.level, data }, prefer: 'return=representation' });
   const report = ins[0];
   // notifications only when both checks saw the map data, otherwise a map outage would look like a change
@@ -684,4 +733,4 @@ async function handler(req) {
 if (typeof Deno !== 'undefined' && typeof Deno.serve === 'function') Deno.serve(handler);
 
 // exported for the automated tests; unused by the Supabase runtime
-export { handler, matchNotice, matchRegistry, words, norm, normHouse, analyseOsm, projector, distanceTo, classify, buildReport, cleanPlot, diffReports, reportFacts, parseJson, nearestCity };
+export { cleanOsm, cleanRev, photonReverse, handler, matchNotice, matchRegistry, words, norm, normHouse, analyseOsm, projector, distanceTo, classify, buildReport, cleanPlot, diffReports, reportFacts, parseJson, nearestCity };

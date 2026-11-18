@@ -112,7 +112,13 @@ async function run(name, viewport, mobile) {
   await page.fill('.composer input', 'limit please'); await page.press('.composer input', 'Enter'); await page.waitForSelector('.toast.show'); assert.match(await page.locator('.toast').innerText(), /20 questions/);
   assert.equal(await page.locator('.msg.user').count(), 1, 'failed question is removed'); await noOverflow('ai'); await shot('6-ai');
   await page.click('[data-act=watch] >> nth=0'); await page.waitForSelector('.plot'); assert.match(await text(), /You’re watching 1 plot\./); assert.match(await text(), /New changes/); await noOverflow('plots'); await shot('7-plots');
-  await page.click('.icon-btn'); await page.waitForSelector('.nitem'); assert.match(await text(), /1 unread/); assert.match(await text(), /medium → high/);
+  await page.click('[data-act="theme"]');
+  assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), 'dark');
+  assert.equal(await page.evaluate(() => getComputedStyle(document.body).backgroundColor), 'rgb(14, 24, 19)');
+  await page.waitForTimeout(500); await shot('7b-dark');
+  await page.click('[data-act="theme"]');
+  assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), 'light');
+  await page.click('.icon-btn[data-href="#/notifications"]'); await page.waitForSelector('.nitem'); assert.match(await text(), /1 unread/); assert.match(await text(), /medium → high/);
   await page.click('[data-tg=notify_digest]'); assert.equal(await page.evaluate(() => window.__st.profile.notify_digest), true);
   await page.click('.nitem >> nth=0'); await page.waitForFunction(() => /0 unread/.test(document.body.innerText)); await noOverflow('notifications'); await shot('8-notifications');
   await page.click('[data-lang=ru]'); assert.match(await text(), /Уведомления/); assert.match(await text(), /средний → высокий/);

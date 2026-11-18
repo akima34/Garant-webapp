@@ -10,6 +10,7 @@ const store = {
 };
 const S = {
   lang: store.get('garant.lang', 'en') === 'ru' ? 'ru' : 'en',
+  theme: (() => { const v = store.get('garant.theme', ''); if (v === 'dark' || v === 'light') return v; try { return matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'; } catch (e) { return 'light'; } })(),
   m: window.innerWidth < 860,
   route: { name: 'home', id: null, q: '' },
   ready: false, user: null, profile: null, unread: 0, menu: false,
@@ -199,6 +200,25 @@ function initials() {
   return ((parts[0] || '?')[0] + ((parts[1] || '')[0] || '')).toUpperCase();
 }
 const userName = () => (S.profile && S.profile.full_name) || (S.user && S.user.email) || '';
+const THEME_ICO = {
+  moon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z"/></svg>',
+  sun: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>',
+};
+function applyTheme() {
+  document.documentElement.dataset.theme = S.theme;
+  const meta = document.querySelector('meta[name="theme-color"]'); if (meta) meta.content = S.theme === 'dark' ? '#0f1a14' : '#ffffff';
+}
+function setTheme(th, remember) {
+  if (th === S.theme) return;
+  S.theme = th; if (remember) store.set('garant.theme', th);
+  store.set('garant.basemap2', '');   // the map follows the new theme
+  applyTheme();
+  document.querySelectorAll('[data-act="theme"]').forEach((b) => { b.innerHTML = th === 'dark' ? THEME_ICO.sun : THEME_ICO.moon; const l = t(th === 'dark' ? 'Light theme' : 'Dark theme'); b.title = l; b.setAttribute('aria-label', l); });
+  document.querySelectorAll('.map-layers [data-base]').forEach((x) => { const on = x.dataset.base === curBase(); x.classList.toggle('on', on); x.setAttribute('aria-pressed', on); });
+  restyleMaps();
+}
+applyTheme();
+try { matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => { if (!store.get('garant.theme', '')) setTheme(e.matches ? 'dark' : 'light', false); }); } catch (e) { /* old browser */ }
 function header(active) {
   const m = S.m, signed = !!S.user;
   const lang = `<div class="lang" role="group" aria-label="Language"><button type="button" data-lang="en" class="${S.lang === 'en' ? 'on' : ''}">EN</button><button type="button" data-lang="ru" class="${S.lang === 'ru' ? 'on' : ''}">RU</button></div>`;
@@ -208,6 +228,7 @@ function header(active) {
     <span class="sp"></span>
     ${signed && !m ? `<nav class="navl"><button type="button" data-href="#/plots" class="${active === 'plots' ? 'on' : ''}">${T('My plots')}</button></nav>` : ''}
     ${lang}
+    <button type="button" class="icon-btn" data-act="theme" aria-label="${T(S.theme === 'dark' ? 'Light theme' : 'Dark theme')}" title="${T(S.theme === 'dark' ? 'Light theme' : 'Dark theme')}">${S.theme === 'dark' ? THEME_ICO.sun : THEME_ICO.moon}</button>
     ${signed
       ? `<button type="button" class="icon-btn" data-href="#/notifications" aria-label="${T('Notifications')}">${I.bell}${S.unread ? '<span class="dot"></span>' : ''}</button>
          <div class="acct"><button type="button" class="avatar" data-act="menu" aria-expanded="${S.menu}" aria-label="${esc(userName())}"><b>${esc(initials())}</b>${m ? '' : `<span>${esc(userName())}</span>`}</button>
@@ -235,45 +256,62 @@ function identity(p) {
 /* ================= map ================= */
 const MAPS = {};       // spec id -> spec, filled while rendering
 let liveMaps = [];
-// Base maps. "Map" is the standard OpenStreetMap rendering: houses, numbers, paths, shops, local names.
-const OSM_RASTER = { version: 8, glyphs: 'https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf',
-  sources: { osm: { type: 'raster', tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'], tileSize: 256, maxzoom: 19, attribution: '© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors' } },
-  layers: [{ id: 'osm', type: 'raster', source: 'osm' }] };
+// Base maps are vector styles (OpenFreeMap, built from OpenStreetMap): sharp on any screen and at any zoom.
+const OFM = 'https://tiles.openfreemap.org/styles/';
 const BASEMAPS = [
-  { id: 'osm', label: 'Map', style: OSM_RASTER },
-  { id: 'detail', label: '3D', style: 'https://tiles.openfreemap.org/styles/liberty' },
-  { id: 'light', label: 'Light', style: 'https://tiles.openfreemap.org/styles/positron' },
+  { id: 'detail', label: 'Map', style: OFM + 'liberty' },
+  { id: 'light', label: 'Light', style: OFM + 'positron' },
+  { id: 'dark', label: 'Dark', style: OFM + 'dark' },
 ];
-const baseById = (id) => BASEMAPS.find((b) => b.id === id) || BASEMAPS[0];
-let baseId = baseById(store.get('garant.basemap', 'osm')).id;
+// used only if the vector styles cannot be loaded
+const OSM_RASTER = { version: 8, sources: { osm: { type: 'raster', tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'], tileSize: 256, maxzoom: 19, attribution: '© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors' } },
+  layers: [{ id: 'osm', type: 'raster', source: 'osm' }] };
+const baseById = (id) => BASEMAPS.find((b) => b.id === id) || null;
+// an explicit choice wins; otherwise the map follows the site theme
+const curBase = () => (baseById(store.get('garant.basemap2', '')) || baseById(S.theme === 'dark' ? 'dark' : 'detail')).id;
+let is3d = store.get('garant.3d', false) === true;
+const hiddenKinds = new Set();
 const KZ_VIEW = { center: [67.3, 48.2], zoom: 3.4 };
 const RISK_KIND = { water: 'Water', construction: 'Construction', planned_road: 'Planned road', power_line: 'Power line', major_road: 'Major road', railway: 'Railway', industrial: 'Industrial area', cemetery: 'Cemetery', landfill: 'Landfill' };
 Object.assign(RU, {
-  'Map': 'Схема', '3D': '3D', 'Light': 'Светлая', 'Planned road': 'Планируемая дорога', 'Major road': 'Крупная дорога', 'Railway': 'Железная дорога', 'Industrial area': 'Промзона', 'Cemetery': 'Кладбище', 'Landfill': 'Свалка',
+  'Map': 'Схема', 'Light': 'Светлая', 'Dark': 'Тёмная', 'Planned road': 'Планируемая дорога', 'Major road': 'Крупная дорога', 'Railway': 'Железная дорога', 'Industrial area': 'Промзона', 'Cemetery': 'Кладбище', 'Landfill': 'Свалка',
   'My location': 'Моё местоположение', 'Full screen': 'Во весь экран', 'Exit full screen': 'Выйти из полноэкранного режима', 'Map style': 'Стиль карты',
+  '3D view': 'Объёмный вид', 'Back to the plot': 'Вернуться к участку', 'Show or hide on the map': 'Показать или скрыть на карте',
   'Looking up the address…': 'Ищем адрес…', 'Check this plot': 'Проверить этот участок', 'Garant checks plots in Kazakhstan only.': 'Garant проверяет участки только в Казахстане.',
   'Your location could not be determined.': 'Не удалось определить ваше местоположение.', 'You are here': 'Вы здесь', 'from the plot': 'от участка',
-  'Click any place on the map to see its address': 'Кликните в любое место карты, чтобы увидеть адрес',
+  'Click any place on the map to see its address': 'Кликните в любое место карты, чтобы увидеть адрес', 'Copy coordinates': 'Скопировать координаты', 'Copied': 'Скопировано',
+  'Dark theme': 'Тёмная тема', 'Light theme': 'Светлая тема',
 });
+const MICO = {
+  locate: '<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/><circle cx="12" cy="12" r="7"/>',
+  full: '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
+  exit: '<path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/>',
+  cube: '<path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3Z"/><path d="m4 7.5 8 4.5 8-4.5M12 12v9"/>',
+  plot: '<path d="M12 21s-6.5-5.6-6.5-11a6.5 6.5 0 0 1 13 0c0 5.4-6.5 11-6.5 11Z"/><circle cx="12" cy="10" r="2.4"/>',
+};
+const mico = (k) => `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${MICO[k]}</svg>`;
 function mapBox(id, spec, legend) {
   MAPS[id] = spec;
-  const leg = (legend || []).map(([style, label]) => `<span><i style="${style}"></i>${T(label)}</span>`).join('');
-  const ico = (d) => `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${d}</svg>`;
+  const leg = (legend || []).map(([style, label, kind]) => kind && kind !== 'plot'
+    ? `<button type="button" data-kind="${kind}" aria-pressed="${!hiddenKinds.has(kind)}" title="${T('Show or hide on the map')}"><i style="${style}"></i>${T(label)}</button>`
+    : `<span><i style="${style}"></i>${T(label)}</span>`).join('');
+  const base = curBase();
+  const btn = (act, label, extra = '') => `<button type="button" data-act-map="${act}" aria-label="${T(label)}" title="${T(label)}" ${extra}>${mico(act === 'tilt' ? 'cube' : act)}</button>`;
   return `<div class="mapbox" data-map="${id}"><div class="map"></div>
+    <div class="map-layers" role="group" aria-label="${T('Map style')}">${BASEMAPS.map((b) => `<button type="button" data-base="${b.id}" class="${b.id === base ? 'on' : ''}" aria-pressed="${b.id === base}">${T(b.label)}</button>`).join('')}</div>
     ${spec.hint ? `<div class="map-hint">${T(spec.hint)}</div>` : ''}
-    <div class="map-zoom"><button type="button" data-zoom="in" aria-label="Zoom in">+</button><button type="button" data-zoom="out" aria-label="Zoom out">−</button>
-      <button type="button" data-act-map="locate" aria-label="${T('My location')}" title="${T('My location')}">${ico('<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/><circle cx="12" cy="12" r="7"/>')}</button>
-      <button type="button" data-act-map="full" aria-label="${T('Full screen')}" title="${T('Full screen')}">${ico('<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>')}</button></div>
-    <div class="map-layers" role="group" aria-label="${T('Map style')}">${BASEMAPS.map((b) => `<button type="button" data-base="${b.id}" class="${b.id === baseId ? 'on' : ''}">${T(b.label)}</button>`).join('')}</div>
+    <div class="map-zoom"><button type="button" data-zoom="in" aria-label="Zoom in" title="Zoom in">+</button><button type="button" data-zoom="out" aria-label="Zoom out" title="Zoom out">−</button>
+      ${btn('locate', 'My location')}${btn('tilt', '3D view', `aria-pressed="${is3d}" class="${is3d ? 'on' : ''}"`)}${spec.plot ? btn('plot', 'Back to the plot') : ''}${btn('full', 'Full screen')}</div>
     ${leg ? `<div class="map-legend">${leg}</div>` : ''}</div>`;
 }
 function plotLegend(features) {
   const kinds = new Set(((features && features.features) || []).map((f) => f.properties.kind));
-  const leg = [['background:rgba(14,159,78,.25);border:1.5px solid #0e9f4e', 'Your plot']];
-  if (kinds.has('water')) leg.push(['background:rgba(47,123,234,.35)', 'Water']);
-  if (kinds.has('construction')) leg.push(['background:rgba(209,138,9,.4)', 'Construction']);
-  if (kinds.has('planned_road')) leg.push(['background:#d63a3e', 'Planned road']);
-  if (kinds.has('power_line')) leg.push(['background:#7a5cd6', 'Power line']);
+  const leg = [['background:rgba(14,159,78,.25);border:1.5px solid #0e9f4e', 'Your plot', 'plot']];
+  if (kinds.has('water')) leg.push(['background:rgba(47,123,234,.45)', 'Water', 'water']);
+  if (kinds.has('construction')) leg.push(['background:rgba(209,138,9,.5)', 'Construction', 'construction']);
+  if (kinds.has('planned_road')) leg.push(['background:#d63a3e', 'Planned road', 'planned_road']);
+  if (kinds.has('power_line')) leg.push(['background:#7a5cd6', 'Power line', 'power_line']);
+  for (const k of ['major_road', 'railway', 'industrial', 'cemetery', 'landfill']) if (kinds.has(k)) leg.push(['background:#8a9a90', RISK_KIND[k], k]);
   return leg;
 }
 function destroyMaps() {
@@ -288,6 +326,8 @@ function circleGeo(lon, lat, r) {
   for (let i = 0; i <= 48; i++) { const a = i / 48 * 2 * Math.PI; pts.push([lon + r * Math.cos(a) / (111320 * Math.cos(lat * Math.PI / 180)), lat + r * Math.sin(a) / 111320]); }
   return { type: 'Feature', properties: {}, geometry: { type: 'Polygon', coordinates: [pts] } };
 }
+// switch every open map to the current base map (used by the theme switch)
+function restyleMaps() { for (const m of liveMaps) if (m._gSetBase) m._gSetBase(curBase()); }
 function mountMaps() {
   destroyMaps();
   document.querySelectorAll('.mapbox[data-map]').forEach((box) => {
@@ -295,54 +335,87 @@ function mountMaps() {
     if (!spec || !el) return;
     const gl = window.maplibregl;
     if (!gl || !gl.Map) { el.innerHTML = `<div class="map-empty">${T('The map could not be loaded. Everything else works.')}</div>`; return; }
-    let map;
+    let map, base = curBase();
     try {
-      map = new gl.Map({ container: el, style: baseById(baseId).style, center: spec.center || KZ_VIEW.center, zoom: spec.zoom == null ? KZ_VIEW.zoom : spec.zoom, maxZoom: 19,
-        attributionControl: { compact: true }, dragRotate: false, pitchWithRotate: false, touchPitch: false, cooperativeGestures: S.m });
+      map = new gl.Map({ container: el, style: baseById(base).style, center: spec.center || KZ_VIEW.center, zoom: spec.zoom == null ? KZ_VIEW.zoom : spec.zoom, maxZoom: 19,
+        pitch: is3d ? 55 : 0, attributionControl: { compact: true }, dragRotate: is3d, pitchWithRotate: is3d, touchPitch: is3d, cooperativeGestures: S.m, fadeDuration: 150 });
     } catch (e) { el.innerHTML = `<div class="map-empty">${T('The map could not be loaded. Everything else works.')}</div>`; return; }
     liveMaps.push(map);
-    map.touchZoomRotate.disableRotation();
+    if (!is3d) map.touchZoomRotate.disableRotation();
     map.addControl(new gl.ScaleControl({ unit: 'metric', maxWidth: 90 }), 'bottom-right');
     box.querySelector('[data-zoom="in"]').onclick = () => map.zoomIn();
     box.querySelector('[data-zoom="out"]').onclick = () => map.zoomOut();
-    let me = null; // last known user position
+    let me = null;
 
-    // --- base map switch; our layers are re-added after every style change ---
-    let fellBack = false;
+    // --- base map; our layers are re-added after every style change ---
+    let styleOk = false, fellBack = false;
     map.on('error', (ev) => {
-      if (fellBack || (ev && (ev.sourceId || ev.tile)) || baseId === 'osm') return;
-      fellBack = true; try { map.setStyle(OSM_RASTER); } catch (e) { /* keep empty map */ }
+      if (styleOk || fellBack || (ev && (ev.sourceId || ev.tile))) return;
+      fellBack = true; try { map.setStyle(OSM_RASTER, { diff: false }); } catch (e) { /* keep empty map */ }
     });
-    box.querySelectorAll('[data-base]').forEach((btn) => btn.addEventListener('click', () => {
-      const b = baseById(btn.dataset.base);
-      if (b.id === baseId && !fellBack) return;
-      baseId = b.id; fellBack = false; store.set('garant.basemap', b.id);
-      document.querySelectorAll('.map-layers [data-base]').forEach((x) => x.classList.toggle('on', x.dataset.base === b.id));
-      map.setStyle(b.style);
-      if (b.id === 'detail') map.easeTo({ pitch: 45, duration: 600 }); else if (map.getPitch()) map.easeTo({ pitch: 0, duration: 400 });
-    }));
-    map.on('style.load', () => draw());
+    const setBase = (id) => {
+      const b = baseById(id); if (!b) return;
+      box.querySelectorAll('[data-base]').forEach((x) => { const on = x.dataset.base === b.id; x.classList.toggle('on', on); x.setAttribute('aria-pressed', on); });
+      if (b.id === base && !fellBack) return;
+      base = b.id; styleOk = false; fellBack = false;
+      map.setStyle(b.style, { diff: false });
+    };
+    map._gSetBase = setBase;
+    box.querySelectorAll('[data-base]').forEach((btn) => btn.addEventListener('click', () => { store.set('garant.basemap2', btn.dataset.base); for (const m of liveMaps) if (m._gSetBase) m._gSetBase(btn.dataset.base); }));
+    map.on('style.load', () => { styleOk = true; draw(); apply3d(); });
 
+    // --- risk layers, one filter per layer plus the legend switches ---
+    const BASEF = {};
+    const kindF = () => ['!', ['in', ['get', 'kind'], ['literal', [...hiddenKinds]]]];
+    const applyKinds = () => { for (const id of Object.keys(BASEF)) if (map.getLayer(id)) map.setFilter(id, ['all', BASEF[id], kindF()]); };
     const draw = () => {
       if (map.getSource('plot')) return;
       const plot = spec.plot;
       if (spec.features && spec.features.features && spec.features.features.length) {
         map.addSource('risk', { type: 'geojson', data: spec.features });
         const poly = ['==', ['geometry-type'], 'Polygon'], line = ['==', ['geometry-type'], 'LineString'], kind = (k) => ['==', ['get', 'kind'], k];
-        map.addLayer({ id: 'risk-fill', type: 'fill', source: 'risk', filter: poly, paint: { 'fill-color': ['match', ['get', 'kind'], 'water', '#2f7bea', 'construction', '#d18a09', '#8a9a90'], 'fill-opacity': 0.22 } });
-        map.addLayer({ id: 'risk-outline', type: 'line', source: 'risk', filter: poly, paint: { 'line-color': ['match', ['get', 'kind'], 'water', '#2f7bea', 'construction', '#d18a09', '#8a9a90'], 'line-width': 1.5 } });
-        map.addLayer({ id: 'risk-line', type: 'line', source: 'risk', filter: ['all', line, ['!', kind('planned_road')], ['!', kind('power_line')]], paint: { 'line-color': ['match', ['get', 'kind'], 'water', '#2f7bea', '#8a9a90'], 'line-width': 2.5 } });
-        map.addLayer({ id: 'risk-road', type: 'line', source: 'risk', filter: ['all', line, kind('planned_road')], paint: { 'line-color': '#d63a3e', 'line-width': 3, 'line-dasharray': [2, 1.5] } });
-        map.addLayer({ id: 'risk-power', type: 'line', source: 'risk', filter: ['all', line, kind('power_line')], paint: { 'line-color': '#7a5cd6', 'line-width': 2, 'line-dasharray': [1, 2] } });
+        const color = ['match', ['get', 'kind'], 'water', '#2f7bea', 'construction', '#d18a09', '#8a9a90'];
+        const add = (id, type, f, paint) => { BASEF[id] = f; map.addLayer({ id, type, source: 'risk', filter: ['all', f, kindF()], paint }); };
+        add('risk-fill', 'fill', poly, { 'fill-color': color, 'fill-opacity': 0.25 });
+        add('risk-outline', 'line', poly, { 'line-color': color, 'line-width': 1.8 });
+        add('risk-line', 'line', ['all', line, ['!', kind('planned_road')], ['!', kind('power_line')]], { 'line-color': ['match', ['get', 'kind'], 'water', '#2f7bea', '#8a9a90'], 'line-width': ['interpolate', ['linear'], ['zoom'], 12, 2, 18, 5] });
+        add('risk-road', 'line', ['all', line, kind('planned_road')], { 'line-color': '#d63a3e', 'line-width': ['interpolate', ['linear'], ['zoom'], 12, 2.5, 18, 6], 'line-dasharray': [2, 1.5] });
+        add('risk-power', 'line', ['all', line, kind('power_line')], { 'line-color': '#7a5cd6', 'line-width': ['interpolate', ['linear'], ['zoom'], 12, 2, 18, 4], 'line-dasharray': [1, 2] });
         // wide invisible lines make thin objects easy to click
-        map.addLayer({ id: 'risk-hit', type: 'line', source: 'risk', paint: { 'line-color': '#000', 'line-opacity': 0, 'line-width': 14 } });
+        add('risk-hit', 'line', ['has', 'kind'], { 'line-color': '#000', 'line-opacity': 0, 'line-width': 16 });
       }
       map.addSource('plot', { type: 'geojson', data: plot && plot.geom ? { type: 'Feature', properties: {}, geometry: plot.geom } : { type: 'FeatureCollection', features: [] } });
-      map.addLayer({ id: 'plot-fill', type: 'fill', source: 'plot', paint: { 'fill-color': '#0e9f4e', 'fill-opacity': 0.2 } });
-      map.addLayer({ id: 'plot-line', type: 'line', source: 'plot', paint: { 'line-color': '#0e9f4e', 'line-width': 2.5 } });
+      map.addLayer({ id: 'plot-fill', type: 'fill', source: 'plot', paint: { 'fill-color': '#0e9f4e', 'fill-opacity': 0.22 } });
+      map.addLayer({ id: 'plot-line', type: 'line', source: 'plot', paint: { 'line-color': '#0e9f4e', 'line-width': 3 } });
       map.addSource('me', { type: 'geojson', data: me ? circleGeo(me.lon, me.lat, me.acc) : { type: 'FeatureCollection', features: [] } });
       map.addLayer({ id: 'me-acc', type: 'fill', source: 'me', paint: { 'fill-color': '#2f7bea', 'fill-opacity': 0.12 } });
       map.addLayer({ id: 'me-acc-line', type: 'line', source: 'me', paint: { 'line-color': '#2f7bea', 'line-width': 1.2, 'line-opacity': 0.6 } });
+    };
+    box.querySelectorAll('.map-legend [data-kind]').forEach((b) => b.addEventListener('click', () => {
+      const k = b.dataset.kind, hide = !hiddenKinds.has(k);
+      if (hide) hiddenKinds.add(k); else hiddenKinds.delete(k);
+      b.setAttribute('aria-pressed', String(!hide)); applyKinds();
+    }));
+
+    // --- 3D: tilted camera with extruded buildings ---
+    const tiltBtn = box.querySelector('[data-act-map="tilt"]');
+    function apply3d() {
+      if (!map.isStyleLoaded()) return;
+      const layers = map.getStyle().layers || [];
+      const native = layers.some((l) => l.type === 'fill-extrusion' && l.id !== 'g-3d');
+      if (is3d && !native && !map.getLayer('g-3d') && map.getSource('openmaptiles')) {
+        const firstSymbol = (layers.find((l) => l.type === 'symbol') || {}).id;
+        map.addLayer({ id: 'g-3d', type: 'fill-extrusion', source: 'openmaptiles', 'source-layer': 'building', minzoom: 14,
+          paint: { 'fill-extrusion-color': base === 'dark' ? '#33453b' : '#dcd6cc', 'fill-extrusion-height': ['coalesce', ['get', 'render_height'], 8], 'fill-extrusion-base': ['coalesce', ['get', 'render_min_height'], 0], 'fill-extrusion-opacity': 0.85 } }, firstSymbol);
+      }
+      if (!is3d && map.getLayer('g-3d')) map.removeLayer('g-3d');
+    }
+    tiltBtn.onclick = () => {
+      is3d = !is3d; store.set('garant.3d', is3d);
+      tiltBtn.classList.toggle('on', is3d); tiltBtn.setAttribute('aria-pressed', is3d);
+      if (is3d) { map.dragRotate.enable(); map.touchZoomRotate.enableRotation(); map.touchPitch.enable(); map.easeTo({ pitch: 55, zoom: Math.max(map.getZoom(), 15.5), duration: 700 }); }
+      else { map.dragRotate.disable(); map.touchZoomRotate.disableRotation(); map.touchPitch.disable(); map.easeTo({ pitch: 0, bearing: 0, duration: 500 }); }
+      apply3d();
     };
 
     if (spec.plot) { const d = document.createElement('div'); d.className = 'gdot'; new gl.Marker({ element: d }).setLngLat([spec.plot.lon, spec.plot.lat]).addTo(map); }
@@ -355,6 +428,13 @@ function mountMaps() {
       const b = new gl.LngLatBounds(); spec.pins.forEach((p) => b.extend([p.lon, p.lat]));
       map.fitBounds(b, { padding: 50, maxZoom: 15, duration: 0 });
     }
+    const plotBtn = box.querySelector('[data-act-map="plot"]');
+    if (plotBtn) plotBtn.onclick = () => map.flyTo({ center: [spec.plot.lon, spec.plot.lat], zoom: Math.max(spec.zoom || 15.5, 15.5), bearing: 0 });
+
+    // --- the hint disappears once the visitor starts using the map ---
+    const hint = box.querySelector('.map-hint');
+    const hideHint = () => { if (hint) hint.classList.add('gone'); };
+    map.on('dragstart', hideHint); map.on('click', hideHint); el.addEventListener('wheel', hideHint, { passive: true, once: true });
 
     // --- my location ---
     let meMarker = null;
@@ -377,6 +457,7 @@ function mountMaps() {
     const setFull = (on) => {
       box.classList.toggle('full', on); document.documentElement.classList.toggle('map-full', on);
       fullBtn.setAttribute('aria-label', t(on ? 'Exit full screen' : 'Full screen')); fullBtn.title = t(on ? 'Exit full screen' : 'Full screen');
+      fullBtn.innerHTML = mico(on ? 'exit' : 'full');
       if (map.cooperativeGestures) { if (on) map.cooperativeGestures.disable(); else if (S.m) map.cooperativeGestures.enable(); }
       setTimeout(() => map.resize(), 30);
     };
@@ -386,22 +467,26 @@ function mountMaps() {
     map.on('remove', () => document.removeEventListener('keydown', onKey));
 
     // --- clicks: risk objects first, then the address of any place ---
-    const popup = new gl.Popup({ closeButton: true, maxWidth: '280px', className: 'gpop', offset: 8 });
+    const popup = new gl.Popup({ closeButton: true, maxWidth: '290px', className: 'gpop', offset: 10 });
     const showPlace = (lat, lon) => {
       if (!inKZ(lat, lon)) { popup.setLngLat([lon, lat]).setHTML(`<p class="small mute">${T('Garant checks plots in Kazakhstan only.')}</p>`).addTo(map); return; }
       const seq = (showPlace.seq = (showPlace.seq || 0) + 1);
       popup.setLngLat([lon, lat]).setHTML(`<div class="loading" style="padding:0;gap:8px"><span class="spin"></span><span class="small mute">${T('Looking up the address…')}</span></div>`).addTo(map);
       geoReverse(lat, lon).then((c) => {
         if (seq !== showPlace.seq || !popup.isOpen()) return;
-        const el2 = document.createElement('div'); el2.className = 'col'; el2.style.gap = '8px';
-        el2.innerHTML = `<div class="col" style="gap:2px"><b style="font-weight:600">${esc(c.title)}</b>${c.sub ? `<span class="cap faint">${esc(c.sub)}</span>` : ''}</div>
-          <button type="button" class="btn btn-p" style="height:34px">${T('Check this plot')}</button>`;
-        el2.querySelector('button').onclick = () => { popup.remove(); setFull(false); setCand(c); go('#/plot'); if (S.route.name === 'plot') render(); };
+        const el2 = document.createElement('div'); el2.className = 'col'; el2.style.gap = '10px';
+        const coords = `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
+        el2.innerHTML = `<div class="col" style="gap:2px"><b style="font-weight:600">${esc(c.title)}</b>${c.sub ? `<span class="cap faint">${esc(c.sub)}</span>` : ''}
+            <button type="button" class="gcopy mono cap" title="${T('Copy coordinates')}">${esc(coords)}</button></div>
+          <button type="button" class="btn btn-p" style="height:36px">${T('Check this plot')}</button>`;
+        el2.querySelector('.btn').onclick = () => { popup.remove(); setFull(false); setCand(c); go('#/plot'); if (S.route.name === 'plot') render(); };
+        el2.querySelector('.gcopy').onclick = (ev) => { const b = ev.currentTarget; try { navigator.clipboard.writeText(coords).then(() => { b.textContent = t('Copied'); setTimeout(() => { b.textContent = coords; }, 1400); }); } catch (e) { /* clipboard not allowed */ } };
         popup.setDOMContent(el2);
       });
     };
+    const hitLayers = () => ['risk-hit', 'risk-fill'].filter((id) => map.getLayer(id));
     map.on('click', (e) => {
-      const hit = map.getLayer('risk-hit') ? map.queryRenderedFeatures(e.point, { layers: ['risk-hit', 'risk-fill'] }) : [];
+      const ls = hitLayers(), hit = ls.length ? map.queryRenderedFeatures(e.point, { layers: ls }) : [];
       if (hit.length) {
         const f = hit[0].properties || {};
         const name = (S.lang === 'ru' ? f.name : f.name_en) || f.name || '';
@@ -412,7 +497,7 @@ function mountMaps() {
       else showPlace(e.lngLat.lat, e.lngLat.lng);
     });
     map.on('mousemove', (e) => {
-      const over = map.getLayer('risk-hit') && map.queryRenderedFeatures(e.point, { layers: ['risk-hit', 'risk-fill'] }).length;
+      const ls = hitLayers(), over = ls.length && map.queryRenderedFeatures(e.point, { layers: ls }).length;
       map.getCanvas().style.cursor = over ? 'pointer' : (spec.onClick ? 'crosshair' : '');
     });
   });
@@ -464,6 +549,53 @@ async function nominatim(path) {
   const res = await fetch(`${NOMINATIM}${path}&accept-language=${S.lang}`, { headers: { Accept: 'application/json' } });
   if (!res.ok) throw new Error('nominatim ' + res.status);
   return res.json();
+}
+// Map data for the report is loaded here, in the browser: OpenStreetMap servers block requests
+// from cloud servers, so the server function receives what the visitor's browser got.
+const OVERPASS_URLS = ['https://overpass-api.de/api/interpreter', 'https://overpass.private.coffee/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
+function overpassQuery(lat, lon, r) {
+  const a = `(around:${r},${lat},${lon})`;
+  return `[out:json][timeout:25];(way${a}[natural=water];relation${a}[natural=water];way${a}[waterway~"^(river|stream|canal)$"];way${a}[landuse=construction];relation${a}[landuse=construction];way${a}[building=construction];way${a}[highway~"^(construction|proposed)$"];way${a}["proposed:highway"];way${a}[railway~"^(rail|construction|proposed)$"];way${a}[highway~"^(motorway|trunk|primary)$"];way${a}[power=line];way${a}[landuse~"^(industrial|landfill|cemetery)$"];);out geom 300;`;
+}
+async function fetchTimed(url, opts, ms) {
+  const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), ms);
+  try { return await fetch(url, { ...opts, signal: ctl.signal }); } finally { clearTimeout(tm); }
+}
+const r6 = (x) => Math.round(x * 1e6) / 1e6;
+const slimGeom = (g) => (Array.isArray(g) ? g.filter((c) => c && typeof c.lat === 'number').map((c) => ({ lat: r6(c.lat), lon: r6(c.lon) })) : undefined);
+async function browserOverpass(lat, lon, r) {
+  const body = 'data=' + encodeURIComponent(overpassQuery(lat, lon, r));
+  for (const url of OVERPASS_URLS) {
+    try {
+      const res = await fetchTimed(url, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body }, 22000);
+      if (!res.ok) continue;
+      const j = await res.json();
+      if (!j || !Array.isArray(j.elements)) continue;
+      const elements = j.elements.slice(0, 600).map((el) => ({ type: el.type, id: el.id, tags: el.tags || {}, geometry: slimGeom(el.geometry),
+        members: Array.isArray(el.members) ? el.members.map((m) => ({ role: m.role || '', geometry: slimGeom(m.geometry) || [] })) : undefined }));
+      return { elements, stamp: (j.osm3s && j.osm3s.timestamp_osm_base) || null };
+    } catch (e) { /* next mirror */ }
+  }
+  return null;
+}
+async function browserReverse(lat, lon) {
+  try {
+    const res = await fetchTimed(`${NOMINATIM}/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=18&addressdetails=1&accept-language=ru`, { headers: { Accept: 'application/json' } }, 9000);
+    if (!res.ok) return null;
+    const j = await res.json();
+    return j && j.address ? { display_name: j.display_name || '', address: j.address } : null;
+  } catch (e) { return null; }
+}
+function plotRadius(p) {
+  const g = p && p.geom, ring = g && g.type === 'Polygon' && g.coordinates && g.coordinates[0];
+  if (!Array.isArray(ring)) return 0;
+  let m = 0; for (const c of ring) m = Math.max(m, Math.hypot((c[1] - p.lat) * 111320, (c[0] - p.lon) * 111320 * Math.cos(p.lat * Math.PI / 180)));
+  return Math.min(400, m);
+}
+async function mapDataFor(p) {
+  if (!p || typeof p.lat !== 'number' || typeof p.lon !== 'number') return {};
+  const [osm, rev] = await Promise.all([browserOverpass(p.lat, p.lon, Math.round(500 + plotRadius(p))), browserReverse(p.lat, p.lon)]);
+  return { ...(osm ? { osm } : {}), ...(rev ? { rev } : {}) };
 }
 async function geoSearch(query) {
   const rows = await nominatim(`/search?format=jsonv2&q=${encodeURIComponent(query)}&countrycodes=kz&limit=8&addressdetails=1&polygon_geojson=1&polygon_threshold=0.00003`);
@@ -950,6 +1082,7 @@ document.addEventListener('click', (e) => {
   const d = el.dataset;
   if (d.zoom) return;
   if (d.lang) { if (S.lang !== d.lang) { S.lang = d.lang; store.set('garant.lang', S.lang); if (S.user) API.updateProfile({ lang: S.lang }); render(); if (S.route.name === 'ai' && S.report) loadSummary(S.report.id); } return; }
+  if (d.act === 'theme') return setTheme(S.theme === 'dark' ? 'light' : 'dark', true);
   if (d.act === 'menu') { S.menu = !S.menu; return render(); }
   if (d.act === 'signout') return void signOut();
   if (d.act === 'open-report') { if (d.signtab) S.signTab = d.signtab; else S.signTab = 'in'; return void openReport(); }
@@ -1039,7 +1172,12 @@ function realApi(sb) {
     async profile() { const r = await rows(sb.from('profiles').select('*').eq('id', uid()).maybeSingle()); return r || null; },
     async updateProfile(p) { await rows(sb.from('profiles').update(p).eq('id', uid())); },
     async cadastral(no) { return (await rows(sb.from('seizure_notices').select('*, project:seizure_projects(*)').eq('cadastral_no', no).limit(5))) || []; },
-    check: (body) => fn({ action: 'check', ...body }),
+    async check(body) {
+      let p = body.plot;
+      if (!p && body.plot_id) p = (S.plot && S.plot.id === body.plot_id) ? S.plot : await rows(sb.from('plots').select('lat, lon, geom').eq('id', body.plot_id).maybeSingle());
+      const extra = await mapDataFor(p);
+      return fn({ action: 'check', ...body, ...extra });
+    },
     ask: (report_id, question, lang) => fn({ action: 'ask', report_id, question, lang }),
     summary: (report_id, lang) => fn({ action: 'summary', report_id, lang }),
     async getReport(id) { return rows(sb.from('reports').select('*, plot:plots(*)').eq('id', id).maybeSingle()); },

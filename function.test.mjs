@@ -27,6 +27,7 @@ globalThis.fetch = async (url, opts = {}) => {
   const body = opts.body && !String(opts.body).startsWith('data=') ? JSON.parse(opts.body) : null;
   if (url.includes('/auth/v1/user')) return opts.headers.Authorization === 'Bearer good' ? R({ id: 'u1', email: 'a@b.kz' }) : R({ msg: 'no' }, 401);
   if (url.includes('nominatim.openstreetmap.org/reverse')) return world.reverse ? R(world.reverse) : R({ error: 'x' }, 500);
+  if (url.includes('photon.komoot.io/reverse')) { world.photonCalls = (world.photonCalls || 0) + 1; return world.photon ? R(world.photon) : R({ features: [] }); }
   if (url.includes('/api/interpreter')) return world.osmFail ? R('busy', 504) : R({ osm3s: { timestamp_osm_base: '2026-11-10T00:00:00Z' }, elements: world.osm });
   if (url.includes('/chat/completions')) {
     if (world.models404 && body.model === 'llama-3.3-70b-versatile') return R({ error: 'model_not_found' }, 404);
@@ -157,6 +158,24 @@ await t('check: when the address lookup fails the report says the lists were not
   world.reverse = null; world.osm = [];
   const d = (await call(plotBody)).report.data;
   assert.ok(d.ok.some((o) => o.code === 'address_unknown' && o.warn) && !d.ok.some((o) => o.code === 'no_seizure'));
+});
+await t('check: map data sent by the browser is used when the servers are blocked', async () => {
+  world.reverse = null; world.osmFail = true; world.osm = [];
+  const osm = { stamp: '2026-11-18T10:00:00Z', elements: [way(1, { waterway: 'river', name: 'Есиль' }, [[30, -400], [30, 400]]), { type: 'evil', id: 'x' }] };
+  const d = (await call({ ...plotBody, osm, rev: rev('улица Кенесары', '21') })).report.data;
+  assert.equal(d.osm.ok, true); assert.equal(d.osm.stamp, '2026-11-18T10:00:00Z');
+  const by = Object.fromEntries(d.items.map((i) => [i.code, i]));
+  assert.equal(by.water.params.distance, 30); assert.equal(by.seizure_exact.level, 'high');
+  assert.equal(fn.cleanOsm({ elements: new Array(601).fill({}) }), null, 'oversized map data is ignored');
+  assert.equal(fn.cleanRev({ display_name: 'x' }), null);
+});
+await t('check: without browser data the server finds the address through Photon', async () => {
+  world.reverse = null; world.osm = [];
+  world.photon = { features: [{ properties: { osm_key: 'building', housenumber: '21', street: 'улица Кенесары', district: 'район Сарыарка', city: 'Астана', country: 'Казахстан' } }] };
+  const d = (await call(plotBody)).report.data;
+  assert.ok(d.items.some((i) => i.code === 'seizure_exact'));
+  assert.ok(d.address_ru.includes('улица Кенесары'));
+  world.photon = null;
 });
 await t('check: repeat click reuses the fresh report; forced re-check notifies about changes for saved plots', async () => {
   world.reverse = rev('улица Достык', '5'); world.osm = [];
