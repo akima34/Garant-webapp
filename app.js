@@ -47,7 +47,7 @@ const RU = {
 'Open the report to see the risks for this plot.':'Откройте отчёт, чтобы увидеть риски по этому участку.',
 'Seizure lists for Astana and Almaty':'Списки изъятия по Астане и Алматы','Water, construction and roads within 500 m':'Вода, стройки и дороги в радиусе 500 м','Source and date for every risk':'Источник и дата каждого риска',
 'Sign in to open report':'Войти и открыть отчёт','Create account':'Создать аккаунт','Open report':'Открыть отчёт','Report':'Отчёт',
-'Checking the plot…':'Проверяем участок…','We are reading live map data and the seizure registry. This takes up to a minute.':'Читаем живые данные карты и реестр изъятия. Это занимает до минуты.',
+'Checking the plot…':'Проверяем участок…','We are reading live map data and the seizure registry. This takes up to a minute when the map servers are busy.':'Читаем живые данные карты и реестр изъятия. Если серверы карты загружены, это занимает до минуты.',
 'Sign in to Garant':'Вход в Garant','Sign in to open the plot report and watch for changes.':'Войдите, чтобы открыть отчёт по участку и следить за изменениями.',
 'Sign up':'Регистрация','Email':'E-mail','Password':'Пароль','Forgot password?':'Забыли пароль?','New password':'Новый пароль','Save password':'Сохранить пароль','Set a new password':'Задайте новый пароль','Enter a new password for your account.':'Введите новый пароль для своего аккаунта.',
 'Your password is stored encrypted. Your plots and reports are visible only to you.':'Пароль хранится в зашифрованном виде. Ваши участки и отчёты видны только вам.',
@@ -554,39 +554,75 @@ async function nominatim(path) {
 // from cloud servers, so the server function receives what the visitor's browser got.
 // public Overpass servers; the main one is tried first, the others join in if it is slow
 const OVERPASS_URLS = ['https://overpass-api.de/api/interpreter', 'https://maps.mail.ru/osm/tools/overpass/api/interpreter', 'https://overpass.private.coffee/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
-function overpassQuery(lat, lon, r) {
-  const a = `(around:${r},${lat},${lon})`;
-  return `[out:json][timeout:40];(way${a}[natural=water];relation${a}[natural=water];way${a}[waterway~"^(river|stream|canal)$"];way${a}[landuse=construction];relation${a}[landuse=construction];way${a}[building=construction];way${a}[highway~"^(construction|proposed)$"];way${a}["proposed:highway"];way${a}[railway~"^(rail|construction|proposed)$"];way${a}[highway~"^(motorway|trunk|primary)$"];way${a}[power=line];way${a}[landuse~"^(industrial|landfill|cemetery)$"];);out geom 300;`;
+// one bounding box for all filters: much cheaper for the server than a dozen "around" searches
+function bboxAround(lat, lon, r) {
+  const dLat = r / 111320, dLon = r / (111320 * Math.cos(lat * Math.PI / 180));
+  return [lat - dLat, lon - dLon, lat + dLat, lon + dLon].map((x) => x.toFixed(5));
 }
+function overpassQuery(lat, lon, r) {
+  const [s, w, n, e] = bboxAround(lat, lon, r);
+  return `[out:json][timeout:40][bbox:${s},${w},${n},${e}];(way[natural=water];relation[natural=water];way[waterway~"^(river|stream|canal)$"];way[landuse=construction];relation[landuse=construction];way[building=construction];way[highway~"^(construction|proposed)$"];way["proposed:highway"];way[railway~"^(rail|construction|proposed)$"];way[highway~"^(motorway|trunk|primary)$"];way[power=line];way[landuse~"^(industrial|landfill|cemetery)$"];);out geom 300;`;
+}
+const r6 = (x) => Math.round(x * 1e6) / 1e6;
+const slimGeom = (g) => (Array.isArray(g) ? g.filter((c) => c && typeof c.lat === 'number').map((c) => ({ lat: r6(c.lat), lon: r6(c.lon) })) : undefined);
+// long rivers and power lines: keep only the runs of points near the plot (as separate pieces, so no false shortcut appears)
+function nearRuns(g, box) {
+  if (!g || g.length <= 400) return [g];
+  const [s, w, n, e] = box.map(Number), inside = (c) => c.lat >= s && c.lat <= n && c.lon >= w && c.lon <= e;
+  const runs = []; let cur = [];
+  for (let i = 0; i < g.length; i++) {
+    const keep = inside(g[i]) || (i > 0 && inside(g[i - 1])) || (i < g.length - 1 && inside(g[i + 1]));
+    if (keep) cur.push(g[i]); else if (cur.length) { runs.push(cur); cur = []; }
+  }
+  if (cur.length) runs.push(cur);
+  return runs;
+}
+function slimElement(el, box) {
+  const out = { type: el.type, id: el.id, tags: el.tags || {} };
+  const g = slimGeom(el.geometry);
+  if (g) { const runs = nearRuns(g, box); if (runs.length === 1) out.geometry = runs[0]; else out.members = runs.map((r) => ({ role: 'outer', geometry: r })); }
+  if (Array.isArray(el.members)) out.members = (out.members || []).concat(el.members.flatMap((m) => nearRuns(slimGeom(m.geometry) || [], box).map((r) => ({ role: m.role || '', geometry: r }))));
+  return out;
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function fetchTimed(url, opts, ms) {
   const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), ms);
   try { return await fetch(url, { ...opts, signal: ctl.signal }); } finally { clearTimeout(tm); }
 }
-const r6 = (x) => Math.round(x * 1e6) / 1e6;
-const slimGeom = (g) => (Array.isArray(g) ? g.filter((c) => c && typeof c.lat === 'number').map((c) => ({ lat: r6(c.lat), lon: r6(c.lon) })) : undefined);
-// "hedged" requests: server N starts after N*6 s unless an earlier one already answered; the first good answer wins
+// Several public servers, started a few seconds apart; a busy server (429/502/504) is retried with a growing pause,
+// as Overpass asks. The first good answer wins and the other requests are cancelled.
 function browserOverpass(lat, lon, r) {
   const body = 'data=' + encodeURIComponent(overpassQuery(lat, lon, r));
-  const ctls = [], timers = [];
-  let done = false, failed = 0;
+  const box = bboxAround(lat, lon, r * 3);
+  const deadline = Date.now() + 55000, ctls = [];
+  let done = false, finished = 0;
   return new Promise((resolve) => {
-    const finish = (v) => { if (done) return; done = true; timers.forEach(clearTimeout); ctls.forEach((c) => c.abort()); resolve(v); };
-    const one = (url) => {
-      if (done) return;
-      const ctl = new AbortController(); ctls.push(ctl);
-      fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body, signal: ctl.signal })
-        .then(async (res) => {
-          if (!res.ok) throw new Error('http ' + res.status);
-          const j = await res.json();
-          if (!j || !Array.isArray(j.elements) || (j.remark && /runtime error|timeout/i.test(j.remark))) throw new Error('bad');
-          const elements = j.elements.slice(0, 600).map((el) => ({ type: el.type, id: el.id, tags: el.tags || {}, geometry: slimGeom(el.geometry),
-            members: Array.isArray(el.members) ? el.members.map((m) => ({ role: m.role || '', geometry: slimGeom(m.geometry) || [] })) : undefined }));
-          finish({ elements, stamp: (j.osm3s && j.osm3s.timestamp_osm_base) || null });
-        })
-        .catch(() => { if (++failed === OVERPASS_URLS.length) finish(null); });
+    const finish = (v) => { if (done) return; done = true; ctls.forEach((c) => c.abort()); resolve(v); };
+    const worker = async (url, delay) => {
+      await sleep(delay);
+      let pause = 2000;
+      while (!done && Date.now() < deadline - 3000) {
+        const ctl = new AbortController(); ctls.push(ctl);
+        const tm = setTimeout(() => ctl.abort(), Math.min(45000, deadline - Date.now()));
+        let retry = false;
+        try {
+          const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body, signal: ctl.signal });
+          if (res.status === 429 || res.status === 502 || res.status === 503 || res.status === 504) retry = true;
+          else if (res.ok) {
+            const j = await res.json();
+            if (j && Array.isArray(j.elements) && !(j.remark && /runtime error|timed out|out of memory/i.test(j.remark))) {
+              return finish({ elements: j.elements.slice(0, 600).map((el) => slimElement(el, box)), stamp: (j.osm3s && j.osm3s.timestamp_osm_base) || null });
+            }
+            retry = true;
+          }
+        } catch (e) { retry = !done && e.name !== 'AbortError'; } finally { clearTimeout(tm); }
+        if (!retry) break;
+        await sleep(pause); pause = Math.min(pause * 2, 16000);
+      }
+      if (++finished === OVERPASS_URLS.length) finish(null);
     };
-    OVERPASS_URLS.forEach((url, i) => timers.push(setTimeout(() => one(url), i * 6000)));
-    timers.push(setTimeout(() => finish(null), 45000));
+    OVERPASS_URLS.forEach((url, i) => worker(url, i * 3000));
+    setTimeout(() => finish(null), deadline - Date.now());
   });
 }
 async function browserReverse(lat, lon) {
@@ -689,7 +725,7 @@ function sPreview() {
   if (!c) return `${header()}<div class="wrap"><div class="panel empty"><p class="mute">${T('Type an address, a place or a cadastral number.')}</p><a class="btn btn-p" href="#/">${T('Find a plot')}</a></div>${footer()}</div>`;
   const signed = !!S.user;
   const card = S.checking
-    ? `<div class="panel lockcard grow"><div class="loading" style="padding:0"><span class="spin"></span><div class="col"><b style="font-weight:600">${T('Checking the plot…')}</b><span class="small mute">${T('We are reading live map data and the seizure registry. This takes up to a minute.')}</span></div></div></div>`
+    ? `<div class="panel lockcard grow"><div class="loading" style="padding:0"><span class="spin"></span><div class="col"><b style="font-weight:600">${T('Checking the plot…')}</b><span class="small mute">${T('We are reading live map data and the seizure registry. This takes up to a minute when the map servers are busy.')}</span></div></div></div>`
     : `<div class="panel lockcard grow">
       <span style="width:48px;height:48px;display:grid;place-items:center;border-radius:14px;background:var(--accent-tint);color:var(--accent-text)">${I.lock}</span>
       <h2 class="h2">${T('Your risk report is ready')}</h2>
