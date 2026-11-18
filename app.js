@@ -235,15 +235,36 @@ function identity(p) {
 /* ================= map ================= */
 const MAPS = {};       // spec id -> spec, filled while rendering
 let liveMaps = [];
-const STYLE_URL = 'https://tiles.openfreemap.org/styles/positron';
-const RASTER = { version: 8, sources: { osm: { type: 'raster', tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'], tileSize: 256, attribution: '© OpenStreetMap contributors' } }, layers: [{ id: 'osm', type: 'raster', source: 'osm' }] };
+// Base maps. "Map" is the standard OpenStreetMap rendering: houses, numbers, paths, shops, local names.
+const OSM_RASTER = { version: 8, glyphs: 'https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf',
+  sources: { osm: { type: 'raster', tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'], tileSize: 256, maxzoom: 19, attribution: '© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors' } },
+  layers: [{ id: 'osm', type: 'raster', source: 'osm' }] };
+const BASEMAPS = [
+  { id: 'osm', label: 'Map', style: OSM_RASTER },
+  { id: 'detail', label: '3D', style: 'https://tiles.openfreemap.org/styles/liberty' },
+  { id: 'light', label: 'Light', style: 'https://tiles.openfreemap.org/styles/positron' },
+];
+const baseById = (id) => BASEMAPS.find((b) => b.id === id) || BASEMAPS[0];
+let baseId = baseById(store.get('garant.basemap', 'osm')).id;
 const KZ_VIEW = { center: [67.3, 48.2], zoom: 3.4 };
+const RISK_KIND = { water: 'Water', construction: 'Construction', planned_road: 'Planned road', power_line: 'Power line', major_road: 'Major road', railway: 'Railway', industrial: 'Industrial area', cemetery: 'Cemetery', landfill: 'Landfill' };
+Object.assign(RU, {
+  'Map': 'Схема', '3D': '3D', 'Light': 'Светлая', 'Planned road': 'Планируемая дорога', 'Major road': 'Крупная дорога', 'Railway': 'Железная дорога', 'Industrial area': 'Промзона', 'Cemetery': 'Кладбище', 'Landfill': 'Свалка',
+  'My location': 'Моё местоположение', 'Full screen': 'Во весь экран', 'Exit full screen': 'Выйти из полноэкранного режима', 'Map style': 'Стиль карты',
+  'Looking up the address…': 'Ищем адрес…', 'Check this plot': 'Проверить этот участок', 'Garant checks plots in Kazakhstan only.': 'Garant проверяет участки только в Казахстане.',
+  'Your location could not be determined.': 'Не удалось определить ваше местоположение.', 'You are here': 'Вы здесь', 'from the plot': 'от участка',
+  'Click any place on the map to see its address': 'Кликните в любое место карты, чтобы увидеть адрес',
+});
 function mapBox(id, spec, legend) {
   MAPS[id] = spec;
   const leg = (legend || []).map(([style, label]) => `<span><i style="${style}"></i>${T(label)}</span>`).join('');
+  const ico = (d) => `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${d}</svg>`;
   return `<div class="mapbox" data-map="${id}"><div class="map"></div>
     ${spec.hint ? `<div class="map-hint">${T(spec.hint)}</div>` : ''}
-    <div class="map-zoom"><button type="button" data-zoom="in" aria-label="Zoom in">+</button><button type="button" data-zoom="out" aria-label="Zoom out">−</button></div>
+    <div class="map-zoom"><button type="button" data-zoom="in" aria-label="Zoom in">+</button><button type="button" data-zoom="out" aria-label="Zoom out">−</button>
+      <button type="button" data-act-map="locate" aria-label="${T('My location')}" title="${T('My location')}">${ico('<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/><circle cx="12" cy="12" r="7"/>')}</button>
+      <button type="button" data-act-map="full" aria-label="${T('Full screen')}" title="${T('Full screen')}">${ico('<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>')}</button></div>
+    <div class="map-layers" role="group" aria-label="${T('Map style')}">${BASEMAPS.map((b) => `<button type="button" data-base="${b.id}" class="${b.id === baseId ? 'on' : ''}">${T(b.label)}</button>`).join('')}</div>
     ${leg ? `<div class="map-legend">${leg}</div>` : ''}</div>`;
 }
 function plotLegend(features) {
@@ -255,7 +276,18 @@ function plotLegend(features) {
   if (kinds.has('power_line')) leg.push(['background:#7a5cd6', 'Power line']);
   return leg;
 }
-function destroyMaps() { for (const m of liveMaps) { try { m.remove(); } catch (e) { /* already gone */ } } liveMaps = []; }
+function destroyMaps() {
+  for (const m of liveMaps) { try { m.remove(); } catch (e) { /* already gone */ } }
+  liveMaps = [];
+  document.querySelectorAll('.mapbox.full').forEach((b) => b.classList.remove('full'));
+  document.documentElement.classList.remove('map-full');
+}
+// a small circle polygon (metres) for the location accuracy
+function circleGeo(lon, lat, r) {
+  const pts = [];
+  for (let i = 0; i <= 48; i++) { const a = i / 48 * 2 * Math.PI; pts.push([lon + r * Math.cos(a) / (111320 * Math.cos(lat * Math.PI / 180)), lat + r * Math.sin(a) / 111320]); }
+  return { type: 'Feature', properties: {}, geometry: { type: 'Polygon', coordinates: [pts] } };
+}
 function mountMaps() {
   destroyMaps();
   document.querySelectorAll('.mapbox[data-map]').forEach((box) => {
@@ -265,14 +297,32 @@ function mountMaps() {
     if (!gl || !gl.Map) { el.innerHTML = `<div class="map-empty">${T('The map could not be loaded. Everything else works.')}</div>`; return; }
     let map;
     try {
-      map = new gl.Map({ container: el, style: STYLE_URL, center: spec.center || KZ_VIEW.center, zoom: spec.zoom == null ? KZ_VIEW.zoom : spec.zoom, attributionControl: { compact: true }, dragRotate: false, pitchWithRotate: false, cooperativeGestures: S.m });
+      map = new gl.Map({ container: el, style: baseById(baseId).style, center: spec.center || KZ_VIEW.center, zoom: spec.zoom == null ? KZ_VIEW.zoom : spec.zoom, maxZoom: 19,
+        attributionControl: { compact: true }, dragRotate: false, pitchWithRotate: false, touchPitch: false, cooperativeGestures: S.m });
     } catch (e) { el.innerHTML = `<div class="map-empty">${T('The map could not be loaded. Everything else works.')}</div>`; return; }
     liveMaps.push(map);
+    map.touchZoomRotate.disableRotation();
+    map.addControl(new gl.ScaleControl({ unit: 'metric', maxWidth: 90 }), 'bottom-right');
     box.querySelector('[data-zoom="in"]').onclick = () => map.zoomIn();
     box.querySelector('[data-zoom="out"]').onclick = () => map.zoomOut();
-    let loaded = false, fellBack = false;
-    // the vector style could not be loaded: fall back to plain OpenStreetMap tiles
-    map.on('error', (ev) => { if (!loaded && !fellBack && !(ev && (ev.sourceId || ev.tile))) { fellBack = true; try { map.setStyle(RASTER); map.once('idle', draw); } catch (e) { /* keep empty map */ } } });
+    let me = null; // last known user position
+
+    // --- base map switch; our layers are re-added after every style change ---
+    let fellBack = false;
+    map.on('error', (ev) => {
+      if (fellBack || (ev && (ev.sourceId || ev.tile)) || baseId === 'osm') return;
+      fellBack = true; try { map.setStyle(OSM_RASTER); } catch (e) { /* keep empty map */ }
+    });
+    box.querySelectorAll('[data-base]').forEach((btn) => btn.addEventListener('click', () => {
+      const b = baseById(btn.dataset.base);
+      if (b.id === baseId && !fellBack) return;
+      baseId = b.id; fellBack = false; store.set('garant.basemap', b.id);
+      document.querySelectorAll('.map-layers [data-base]').forEach((x) => x.classList.toggle('on', x.dataset.base === b.id));
+      map.setStyle(b.style);
+      if (b.id === 'detail') map.easeTo({ pitch: 45, duration: 600 }); else if (map.getPitch()) map.easeTo({ pitch: 0, duration: 400 });
+    }));
+    map.on('style.load', () => draw());
+
     const draw = () => {
       if (map.getSource('plot')) return;
       const plot = spec.plot;
@@ -284,13 +334,17 @@ function mountMaps() {
         map.addLayer({ id: 'risk-line', type: 'line', source: 'risk', filter: ['all', line, ['!', kind('planned_road')], ['!', kind('power_line')]], paint: { 'line-color': ['match', ['get', 'kind'], 'water', '#2f7bea', '#8a9a90'], 'line-width': 2.5 } });
         map.addLayer({ id: 'risk-road', type: 'line', source: 'risk', filter: ['all', line, kind('planned_road')], paint: { 'line-color': '#d63a3e', 'line-width': 3, 'line-dasharray': [2, 1.5] } });
         map.addLayer({ id: 'risk-power', type: 'line', source: 'risk', filter: ['all', line, kind('power_line')], paint: { 'line-color': '#7a5cd6', 'line-width': 2, 'line-dasharray': [1, 2] } });
+        // wide invisible lines make thin objects easy to click
+        map.addLayer({ id: 'risk-hit', type: 'line', source: 'risk', paint: { 'line-color': '#000', 'line-opacity': 0, 'line-width': 14 } });
       }
       map.addSource('plot', { type: 'geojson', data: plot && plot.geom ? { type: 'Feature', properties: {}, geometry: plot.geom } : { type: 'FeatureCollection', features: [] } });
       map.addLayer({ id: 'plot-fill', type: 'fill', source: 'plot', paint: { 'fill-color': '#0e9f4e', 'fill-opacity': 0.2 } });
       map.addLayer({ id: 'plot-line', type: 'line', source: 'plot', paint: { 'line-color': '#0e9f4e', 'line-width': 2.5 } });
+      map.addSource('me', { type: 'geojson', data: me ? circleGeo(me.lon, me.lat, me.acc) : { type: 'FeatureCollection', features: [] } });
+      map.addLayer({ id: 'me-acc', type: 'fill', source: 'me', paint: { 'fill-color': '#2f7bea', 'fill-opacity': 0.12 } });
+      map.addLayer({ id: 'me-acc-line', type: 'line', source: 'me', paint: { 'line-color': '#2f7bea', 'line-width': 1.2, 'line-opacity': 0.6 } });
     };
-    map.on('load', () => { loaded = true; draw(); });
-    map.on('styledata', () => { if (fellBack && map.isStyleLoaded()) draw(); });
+
     if (spec.plot) { const d = document.createElement('div'); d.className = 'gdot'; new gl.Marker({ element: d }).setLngLat([spec.plot.lon, spec.plot.lat]).addTo(map); }
     (spec.pins || []).forEach((p, i) => {
       const d = document.createElement('button'); d.type = 'button'; d.className = 'gpin' + (p.sel ? ' sel' : ''); d.textContent = String(i + 1); d.setAttribute('aria-label', p.label || '');
@@ -301,7 +355,66 @@ function mountMaps() {
       const b = new gl.LngLatBounds(); spec.pins.forEach((p) => b.extend([p.lon, p.lat]));
       map.fitBounds(b, { padding: 50, maxZoom: 15, duration: 0 });
     }
-    if (spec.onClick) { map.getCanvas().style.cursor = 'crosshair'; map.on('click', (e) => spec.onClick(e.lngLat.lat, e.lngLat.lng)); }
+
+    // --- my location ---
+    let meMarker = null;
+    box.querySelector('[data-act-map="locate"]').onclick = (ev) => {
+      const btn = ev.currentTarget;
+      if (!navigator.geolocation) { toast('Your location could not be determined.'); return; }
+      btn.classList.add('busy');
+      navigator.geolocation.getCurrentPosition((pos) => {
+        btn.classList.remove('busy');
+        me = { lat: pos.coords.latitude, lon: pos.coords.longitude, acc: Math.min(2000, Math.max(5, pos.coords.accuracy || 30)) };
+        if (!meMarker) { const d = document.createElement('div'); d.className = 'medot'; d.title = t('You are here'); meMarker = new gl.Marker({ element: d }); }
+        meMarker.setLngLat([me.lon, me.lat]).addTo(map);
+        const src = map.getSource('me'); if (src) src.setData(circleGeo(me.lon, me.lat, me.acc));
+        map.flyTo({ center: [me.lon, me.lat], zoom: Math.max(map.getZoom(), 16) });
+      }, () => { btn.classList.remove('busy'); toast('Your location could not be determined.'); }, { enableHighAccuracy: true, timeout: 12000, maximumAge: 60000 });
+    };
+
+    // --- full screen (a fixed overlay works on every phone, unlike the Fullscreen API) ---
+    const fullBtn = box.querySelector('[data-act-map="full"]');
+    const setFull = (on) => {
+      box.classList.toggle('full', on); document.documentElement.classList.toggle('map-full', on);
+      fullBtn.setAttribute('aria-label', t(on ? 'Exit full screen' : 'Full screen')); fullBtn.title = t(on ? 'Exit full screen' : 'Full screen');
+      if (map.cooperativeGestures) { if (on) map.cooperativeGestures.disable(); else if (S.m) map.cooperativeGestures.enable(); }
+      setTimeout(() => map.resize(), 30);
+    };
+    fullBtn.onclick = () => setFull(!box.classList.contains('full'));
+    const onKey = (e) => { if (e.key === 'Escape' && box.classList.contains('full')) setFull(false); };
+    document.addEventListener('keydown', onKey);
+    map.on('remove', () => document.removeEventListener('keydown', onKey));
+
+    // --- clicks: risk objects first, then the address of any place ---
+    const popup = new gl.Popup({ closeButton: true, maxWidth: '280px', className: 'gpop', offset: 8 });
+    const showPlace = (lat, lon) => {
+      if (!inKZ(lat, lon)) { popup.setLngLat([lon, lat]).setHTML(`<p class="small mute">${T('Garant checks plots in Kazakhstan only.')}</p>`).addTo(map); return; }
+      const seq = (showPlace.seq = (showPlace.seq || 0) + 1);
+      popup.setLngLat([lon, lat]).setHTML(`<div class="loading" style="padding:0;gap:8px"><span class="spin"></span><span class="small mute">${T('Looking up the address…')}</span></div>`).addTo(map);
+      geoReverse(lat, lon).then((c) => {
+        if (seq !== showPlace.seq || !popup.isOpen()) return;
+        const el2 = document.createElement('div'); el2.className = 'col'; el2.style.gap = '8px';
+        el2.innerHTML = `<div class="col" style="gap:2px"><b style="font-weight:600">${esc(c.title)}</b>${c.sub ? `<span class="cap faint">${esc(c.sub)}</span>` : ''}</div>
+          <button type="button" class="btn btn-p" style="height:34px">${T('Check this plot')}</button>`;
+        el2.querySelector('button').onclick = () => { popup.remove(); setFull(false); setCand(c); go('#/plot'); if (S.route.name === 'plot') render(); };
+        popup.setDOMContent(el2);
+      });
+    };
+    map.on('click', (e) => {
+      const hit = map.getLayer('risk-hit') ? map.queryRenderedFeatures(e.point, { layers: ['risk-hit', 'risk-fill'] }) : [];
+      if (hit.length) {
+        const f = hit[0].properties || {};
+        const name = (S.lang === 'ru' ? f.name : f.name_en) || f.name || '';
+        popup.setLngLat(e.lngLat).setHTML(`<div class="col" style="gap:2px"><b style="font-weight:600">${T(RISK_KIND[f.kind] || 'Place')}</b>${name ? `<span class="small">${esc(name)}</span>` : ''}<span class="cap faint">${esc(fmtDist(Number(f.dist)))} ${f.dist > 0 ? T('from the plot') : ''} · OpenStreetMap</span></div>`).addTo(map);
+        return;
+      }
+      if (spec.onClick) spec.onClick(e.lngLat.lat, e.lngLat.lng);
+      else showPlace(e.lngLat.lat, e.lngLat.lng);
+    });
+    map.on('mousemove', (e) => {
+      const over = map.getLayer('risk-hit') && map.queryRenderedFeatures(e.point, { layers: ['risk-hit', 'risk-fill'] }).length;
+      map.getCanvas().style.cursor = over ? 'pointer' : (spec.onClick ? 'crosshair' : '');
+    });
   });
 }
 
@@ -394,7 +507,7 @@ function sHome() {
       </form>
       <p class="faint small">${T('For example: 21-318-067-2166 or Kenesary 21, Astana')}</p>
     </div>
-    <div class="hero-map">${mapBox('home', { hint: 'Click the map to pick a place', onClick: pickPoint })}</div>
+    <div class="hero-map">${mapBox('home', { hint: 'Click any place on the map to see its address' })}</div>
   </section>
   <section class="col" style="gap:16px"><span class="eyebrow">${T('How it works')}</span>
     <div class="row" style="gap:16px">${steps.map(([n, h, d]) => `<div class="panel pad step-card"><span class="step-n">${n}</span><h3 class="h3">${T(h)}</h3><p class="mute small">${T(d)}</p></div>`).join('')}</div>
@@ -419,7 +532,7 @@ function sSearch() {
     <div class="chips">${FILTERS.map(([k, l]) => `<button type="button" class="chip ${S.filter === k ? 'on' : ''}" data-filter="${k}">${T(l)}</button>`).join('')}</div>
     ${body}</div>`;
   const pins = res.map((r, i) => ({ lat: r.lat, lon: r.lon, sel: i === sel, label: r.title }));
-  const spec = { pins, onPin: (i) => chooseResult(i), onClick: pickPoint, hint: 'Click the map to pick a place' };
+  const spec = { pins, onPin: (i) => chooseResult(i), hint: 'Click any place on the map to see its address' };
   if (pins.length === 1) { spec.center = [pins[0].lon, pins[0].lat]; spec.zoom = 15; }
   const map = mapBox('search', spec);
   const count = S.results ? (ru() ? `Найдено: ${res.length} по запросу «${S.q}»` : `${res.length} found for “${S.q}”`) : '';
