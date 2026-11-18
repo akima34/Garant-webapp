@@ -553,7 +553,7 @@ async function nominatim(path) {
 // Map data for the report is loaded here, in the browser: OpenStreetMap servers block requests
 // from cloud servers, so the server function receives what the visitor's browser got.
 // public Overpass servers; the main one is tried first, the others join in if it is slow
-const OVERPASS_URLS = ['https://overpass-api.de/api/interpreter', 'https://maps.mail.ru/osm/tools/overpass/api/interpreter', 'https://overpass.private.coffee/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
+const OVERPASS_URLS = ['https://overpass-api.de/api/interpreter', 'https://maps.mail.ru/osm/tools/overpass/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
 // one bounding box for all filters: much cheaper for the server than a dozen "around" searches
 function bboxAround(lat, lon, r) {
   const dLat = r / 111320, dLon = r / (111320 * Math.cos(lat * Math.PI / 180));

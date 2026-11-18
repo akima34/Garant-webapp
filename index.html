@@ -300,6 +300,9 @@ a { color: inherit; text-decoration: none; }
 :root[data-theme="dark"] { --icon-filter: invert(1); }
 .mapbox.full { position: fixed; inset: 0; z-index: 1000; aspect-ratio: auto; border-radius: 0; border: 0; }
 html.map-full, html.map-full body { overflow: hidden; }
+html.map-full .hdr, html.map-full .toast { visibility: hidden; }
+html.map-full .mapbox.full { z-index: 2000; }
+html.map-full .scr, html.map-full .hero, html.map-full .hero-map, html.map-full .hero > * { z-index: auto !important; transform: none !important; filter: none !important; overflow: visible !important; }
 .medot { width: 16px; height: 16px; border-radius: 50%; background: #2f7bea; border: 3px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,.3); }
 .gpop .maplibregl-popup-content { border-radius: 12px; padding: 12px 30px 12px 14px; font: 13px var(--font); background: var(--panel); color: var(--fg); box-shadow: 0 6px 24px rgba(0,0,0,.25); border: 1px solid var(--line); }
 .gpop.maplibregl-popup-anchor-bottom .maplibregl-popup-tip, .gpop.maplibregl-popup-anchor-bottom-left .maplibregl-popup-tip, .gpop.maplibregl-popup-anchor-bottom-right .maplibregl-popup-tip { border-top-color: var(--panel); }
