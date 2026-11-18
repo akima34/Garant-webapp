@@ -426,6 +426,7 @@ async function buildReport(req, plot, pre = {}) {
       }
       // without the official address the lists were compared only by cadastral number: say so
       if (!matches.length && !rev) ok.push({ code: 'address_unknown', warn: true, source: { name: 'registry' }, date: today });
+      else if (!matches.length && !notices.length) ok.push({ code: 'registry_no_addresses', warn: true, params: { city_ru: city.name_ru, city_en: city.name_en }, source: { name: 'registry' }, date: today });
       else if (!matches.length) ok.push({ code: 'no_seizure', params: { city_ru: city.name_ru, city_en: city.name_en, checked: notices.length }, source: { name: 'registry' }, date: today });
       const matchedIds = new Set(matches.map((m) => m.project && m.project.id));
       const seen = new Set();
@@ -573,6 +574,7 @@ const OK_TEXT = {
   no_construction: () => 'No construction sites or planned roads within 500 m in OpenStreetMap.',
   no_seizure: (p) => `The address does not match any of the ${p.checked} entries in the seizure registry for ${p.city_en}.`,
   address_unknown: () => 'The address of the point could not be determined during this check, so the seizure lists were NOT compared by address.',
+  registry_no_addresses: (p) => `Garant knows of seizure projects in ${p.city_en}, but their addresses are not published; the plot could NOT be compared with them.`,
   no_registry: (p) => `There is no seizure registry in Garant for this location${p && p.city_en ? ' (' + p.city_en + ')' : ''}; seizure decrees must be checked with the local akimat.`,
   no_official_layers: () => 'Official red lines, the master plan and flood zones are not available as open data and were NOT checked.',
   osm_unavailable: () => 'OpenStreetMap data could not be loaded during this check, so nearby objects were NOT checked.',
